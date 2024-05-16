@@ -1,3 +1,4 @@
+# Github workflow for terraform IaaC with github actions
 name: "Vprofile IAC"
 on:
   push:
@@ -6,14 +7,18 @@ on:
       - stage
     paths:
       - terraform/**
+      # any changes in this folder and if main or stage branch and if push then the workflow will get triggered
   pull_request:
     branches:
       - main
+      # when this pull request gets triggered this will trigger the workflow
     paths:
       - terraform/**
 
 env:
   # Credentials for deployment to AWS
+  # terraform needs these credentials to connect to AWS
+  # secrets.* values have been added to github secrets for this repository
   AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
   AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
   # S3 bucket for the Terraform state
@@ -24,23 +29,28 @@ env:
 jobs:
   terraform:
     name: "Apply Terraform Code changes"
+    # runner is on github. Use ubuntu-latest for maven, java, and nodejs
     runs-on: ubuntu-latest
     defaults:
       run:
         shell: bash
         working-directory: ./terraform
+        # the working directory will be the terraform folder in the github repo below that is checked out. 
+        # The terraform directoy is at the same level as .github, and terraform directory has all the .tf files.
+
     steps:
-      - name: Checkout Source Code
-        uses: actions/checkout@v4
+      - name: Checkout Source Code # The working dirctory is ./terraform so the steps below for terraform can be executed
+        uses: actions/checkout@v4  # https://github.com/marketplace/actions/checkout
 
       - name: Setup Terraform with specified version on the runner
-        uses: hashicorp/setup-terraform@v2
+        uses: hashicorp/setup-terraform@v2  # https://github.com/marketplace/actions/hashicorp-setup-terraform
         # with:
         # terraform_version: 1.6.3
 
       - name: Terraform Init
         id: init
         run: terraform init -backend-config="bucket=$BUCKET_TF_STATE"
+        # BUCKET_TF_STATE is specified in env above. The state will be stored in the S3 bucket.
 
       - name: Terraform Format
         id: fmt
@@ -48,6 +58,7 @@ jobs:
 
         #run: terraform fmt -check
         # remove the check because it is failing on my setup due to comments
+        # the format will be checked and will return nonzero error code if the format is incorrect and the workflow will be failed!! Zero exit code is pass.
 
       - name: Terraform Validate
         id: validate
@@ -56,8 +67,49 @@ jobs:
       - name: Terraform Plan
         id: plan
         run: terraform plan -no-color -input=false -out planfile
+        # no color output, no passing of parameters to other process, store in "planfile"
+        # the outfile will help in debugging
+        # Saves the plan to a file that can be passed to the Terraform apply command to execute the planned changes. 
+        # Any filename is allowed, but the recommended naming convention is to name it “tfplan.” Do not use the “.tf” suffix, 
+        # as this will lead Terraform to interpret the file as a configuration script and will fail
         continue-on-error: true
+        # this is to pass to next step for the true error checking
 
       - name: Terraform Plan Status
         if: steps.plan.outcome == 'failure'
         run: exit 1
+
+        # The following steps will only execute with a push to the main branch (except for Configure AWS credentials, this will be
+        # executed with either push to stage or push to main)   
+
+      - name: Terraform Apply (only push and only if push to main)
+        # planfile is the output file from the terraform plan step above. We will apply this terraform plan.
+        id: apple
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        run: terraform apply -auto-approve -input=false -parallelism=1 planfile
+
+        # The next block of steps are for aws configure of the runner with the IAM administrator in github secrets
+        # Once the aws configure is done, the runner has access to aws cli to apply configurations with kubectl onto
+        # the EKS cluster created by the terraform apply, in  previous step.
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+        # Next thing to do is to update the kubeconfig file (~/.kube/config) on the runner so that the runner can execute the 
+        # kubectl apply of the yaml files to deploy to the k8s cluster (nginx installation, the next step)
+        # The kubeconfig update requires access to the deployed EKS cluster control (see command below) and IAM Admin credentials (see above)
+      - name: Get Kube config file from k8s controller/master
+        id: getconfig
+        if: steps.apple.outcome == 'success'
+        # this can only be done if the terraform apply in id:apple is a success and EKS cluster is up and running
+        run: aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name ${{ env.EKS_CLUSTER }}
+
+        # Next, Install the nginx ingress controller(frontend) onto the k8s cluster. This can be done through kubectl apply below
+        # This can only be done if both the terraform apply is successful and the kubeconfig file is updated on the github runner from the k8s controller 
+        # running in the EKS cluster.  kubectl can only be run if the kubeconfig file is on the runner (see previous step)
+      - name: Install Ingress Controller
+        if: steps.apple.outcome == 'success' && steps.getconfig.outcome == 'success'
+        run: kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.1.3/deploy/static/provider/aws/deploy.yaml
